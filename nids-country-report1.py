@@ -1,67 +1,124 @@
 import requests
+import pycountry
+
+
 CAIDA_URL = "https://api.asrank.caida.org/v2/restful/asns"
 
-country_code = "HU"
 TOP_N = 15
-
-
-params = {
-    "country": country_code,
-    "verbose": "",
-    "page_size": TOP_N,
-    "page_number": 1,
-    "sort": "rank"
-}
-
-
-response = requests.get(
-    CAIDA_URL,
-    params=params,
-    timeout=30
-)
-
-response.raise_for_status()
-
-caida_data = response.json()
+PAGE_SIZE = 500
 
 
 # --------------------------------
-# Get ASRank response
+# Get country from user
 # --------------------------------
 
-asns = caida_data["data"]["asns"]
+country_input = input(
+    "Enter a country name or country code: "
+).strip()
 
-total = asns["totalCount"]
+try:
 
-edges = asns["edges"]
+    country_obj = pycountry.countries.lookup(country_input)
+
+    country_code = country_obj.alpha_2
+    country_name = country_obj.name
+
+except LookupError:
+
+    print("Country not found.")
+    exit()
 
 
-# Sort by CAIDA rank just to make sure
-edges = sorted(
-    edges,
-    key=lambda edge: edge["node"].get(
-        "rank",
-        float("inf")
+# --------------------------------
+# Find top 15 ASNs for country
+# --------------------------------
+
+country_asns = []
+
+page_number = 1
+
+
+while len(country_asns) < TOP_N:
+
+    params = {
+        "verbose": "",
+        "page_size": PAGE_SIZE,
+        "page_number": page_number,
+        "sort": "rank"
+    }
+
+
+    response = requests.get(
+        CAIDA_URL,
+        params=params,
+        timeout=30
     )
-)
+
+    response.raise_for_status()
+
+    caida_data = response.json()
 
 
-# Keep ONLY top 15
-edges = edges[:TOP_N]
+    asns = caida_data["data"]["asns"]
+
+    edges = asns["edges"]
 
 
-print(f"\nTotal ASNs in {country_code}: {total}")
+    # No more results
+    if not edges:
+        break
+
+
+    # --------------------------------
+    # Check each ASN's country
+    # --------------------------------
+
+    for edge in edges:
+
+        item = edge["node"]
+
+        country = (
+            item.get("country") or {}
+        ).get(
+            "iso",
+            "Unknown"
+        )
+
+
+        # Only keep selected country
+        if country == country_code:
+
+            country_asns.append(item)
+
+
+        # Stop immediately once we have 15
+        if len(country_asns) == TOP_N:
+            break
+
+
+    print(
+        f"Checked page {page_number} "
+        f"- found {len(country_asns)}/{TOP_N}"
+    )
+
+    page_number += 1
+
+
+# --------------------------------
+# Print results
+# --------------------------------
+
+print()
 
 print(
-    f"\nTop {TOP_N} ASNs for {country_code}"
+    f"Top {len(country_asns)} ASNs for "
+    f"{country_name} ({country_code})"
 )
 
-print("-" * 90)
+print("-" * 100)
 
 
-for edge in edges:
-
-    item = edge["node"]
+for item in country_asns:
 
     asn = item["asn"]
 
@@ -89,10 +146,11 @@ for edge in edges:
         0
     )
 
+
     print(
         f"AS{asn:<10} "
         f"{asn_name:<35} "
         f"{country:<5} "
-        f"Rank: {rank:<8} "
+        f"Global ASRank: {rank:<8} "
         f"Cone: {cone_size}"
     )
