@@ -1,6 +1,6 @@
+import math
 import requests
 import pycountry
-import math
 
 
 CAIDA_URL = "https://api.asrank.caida.org/v2/graphql"
@@ -8,10 +8,6 @@ CAIDA_URL = "https://api.asrank.caida.org/v2/graphql"
 TOP_N = 15
 PAGE_SIZE = 5000
 
-
-# --------------------------------
-# GraphQL query
-# --------------------------------
 
 QUERY = """
 query GetASNs($first: Int!, $offset: Int!) {
@@ -49,7 +45,7 @@ query GetASNs($first: Int!, $offset: Int!) {
 
 
 # ================================================================
-# GET TOP ASNs FOR COUNTRY
+# GET COUNTRY'S TOP CAIDA ASNs
 # ================================================================
 
 def get_top_country_asns(
@@ -58,9 +54,9 @@ def get_top_country_asns(
     page_size=PAGE_SIZE
 ):
 
-    # --------------------------------
-    # Convert country name/code
-    # --------------------------------
+    # ------------------------------------------------
+    # Convert country input to country name + code
+    # ------------------------------------------------
 
     try:
 
@@ -78,9 +74,9 @@ def get_top_country_asns(
         )
 
 
-    # --------------------------------
+    # ------------------------------------------------
     # Variables
-    # --------------------------------
+    # ------------------------------------------------
 
     top_country_asns = []
 
@@ -107,7 +103,7 @@ def get_top_country_asns(
 
 
     # ============================================================
-    # SCAN ENTIRE CAIDA DATASET
+    # SCAN COMPLETE CAIDA DATASET
     # ============================================================
 
     while True:
@@ -141,9 +137,9 @@ def get_top_country_asns(
         caida_data = response.json()
 
 
-        # --------------------------------
-        # Check GraphQL errors
-        # --------------------------------
+        # ------------------------------------------------
+        # GraphQL errors
+        # ------------------------------------------------
 
         if "errors" in caida_data:
 
@@ -163,37 +159,38 @@ def get_top_country_asns(
             )
 
 
-        asns = caida_data["data"]["asns"]
+        asns_data = caida_data["data"]["asns"]
 
-        total_count = asns["totalCount"]
+        total_count = asns_data["totalCount"]
 
-        edges = asns["edges"]
+        edges = asns_data["edges"]
 
-        page_info = asns["pageInfo"]
+        page_info = asns_data["pageInfo"]
 
 
-        # --------------------------------
-        # No more records
-        # --------------------------------
+        # ------------------------------------------------
+        # No more results
+        # ------------------------------------------------
 
         if not edges:
-
             break
 
 
-        # --------------------------------
-        # Calculate pages once
-        # --------------------------------
+        # ------------------------------------------------
+        # Calculate total pages
+        # ------------------------------------------------
 
         if total_pages is None:
 
+            actual_page_size = len(edges)
+
             total_pages = math.ceil(
-                total_count / len(edges)
+                total_count / actual_page_size
             )
 
 
         # ========================================================
-        # SEARCH PAGE
+        # SEARCH CURRENT PAGE
         # ========================================================
 
         for edge in edges:
@@ -209,18 +206,18 @@ def get_top_country_asns(
             )
 
 
-            # Not selected country
+            # Not our selected country
             if country != country_code:
-
                 continue
 
 
-            asn = item["asn"]
+            asn = int(
+                item["asn"]
+            )
 
 
-            # Skip duplicates
+            # Avoid duplicates
             if asn in seen_asns:
-
                 continue
 
 
@@ -229,12 +226,11 @@ def get_top_country_asns(
             total_country_asns += 1
 
 
-            # --------------------------------
-            # Keep only top N
+            # ------------------------------------------------
+            # Keep only the first top N ranked ASNs
             #
-            # CAIDA already returns records
-            # sorted by global ASRank
-            # --------------------------------
+            # CAIDA results are already sorted by rank.
+            # ------------------------------------------------
 
             if (
                 item.get("rank") is not None
@@ -247,9 +243,9 @@ def get_top_country_asns(
                 )
 
 
-        # --------------------------------
-        # Update progress
-        # --------------------------------
+        # ------------------------------------------------
+        # Progress
+        # ------------------------------------------------
 
         records_checked += len(edges)
 
@@ -269,18 +265,17 @@ def get_top_country_asns(
         )
 
 
-        # --------------------------------
-        # End of CAIDA dataset
-        # --------------------------------
+        # ------------------------------------------------
+        # End of dataset
+        # ------------------------------------------------
 
         if not page_info["hasNextPage"]:
-
             break
 
 
-        # --------------------------------
-        # Move exactly by number returned
-        # --------------------------------
+        # ------------------------------------------------
+        # Move forward by number actually returned
+        # ------------------------------------------------
 
         offset += len(edges)
 
@@ -288,19 +283,18 @@ def get_top_country_asns(
 
 
     # ============================================================
-    # SUMMARY
+    # CAIDA SUMMARY
     # ============================================================
 
     print()
-
     print("-" * 100)
 
     print("CAIDA ASRank scan complete.")
 
     print(
         f"Dataset coverage: "
-        f"{records_checked:,}/"
-        f"{total_count:,} ASNs checked "
+        f"{records_checked:,}/{total_count:,} "
+        f"ASNs checked "
         f"({records_checked / total_count * 100:.1f}%)"
     )
 
@@ -329,7 +323,7 @@ def get_top_country_asns(
 
 
 # ================================================================
-# ALLOW THIS FILE TO BE TESTED BY ITSELF
+# ALLOW THIS FILE TO BE TESTED SEPARATELY
 # ================================================================
 
 if __name__ == "__main__":
@@ -348,18 +342,28 @@ if __name__ == "__main__":
     except Exception as e:
 
         print(e)
-
         exit()
 
 
     print()
     print(
-        f"Top {len(result['top_asns'])} ASNs for "
+        f"Top {len(result['top_asns'])} "
+        f"CAIDA ASRank ASNs for "
         f"{result['country_name']} "
         f"({result['country_code']})"
     )
 
-    print("-" * 100)
+    print("-" * 110)
+
+    print(
+        f"{'AS':<14}"
+        f"{'Org Name':<42}"
+        f"{'Country':<10}"
+        f"{'ASRank':<12}"
+        f"{'Cone':<10}"
+    )
+
+    print("-" * 110)
 
 
     for item in result["top_asns"]:
@@ -371,9 +375,16 @@ if __name__ == "__main__":
             "Unknown"
         )
 
+        country = (
+            item.get("country") or {}
+        ).get(
+            "iso",
+            "Unknown"
+        )
+
         rank = item.get(
             "rank",
-            "Unknown"
+            "N/A"
         )
 
         cone = (
@@ -385,8 +396,9 @@ if __name__ == "__main__":
 
 
         print(
-            f"AS{asn:<10} "
-            f"{name:<40} "
-            f"ASRank: {rank:<8} "
-            f"Cone: {cone}"
+            f"AS{asn:<12}"
+            f"{name:<42}"
+            f"{country:<10}"
+            f"{str(rank):<12}"
+            f"{str(cone):<10}"
         )

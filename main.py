@@ -17,7 +17,8 @@ country_input = input(
 
 
 # ================================================================
-# PART 1 - CAIDA ASRank
+# PART 1
+# CAIDA ASRank
 # ================================================================
 
 try:
@@ -41,86 +42,42 @@ except Exception as e:
 
 
 country_name = (
-    caida_result["country_name"]
+    caida_result[
+        "country_name"
+    ]
 )
 
 country_code = (
-    caida_result["country_code"]
+    caida_result[
+        "country_code"
+    ]
 )
 
 country_asns = (
-    caida_result["top_asns"]
+    caida_result[
+        "top_asns"
+    ]
 )
 
 
 # ================================================================
-# SHOW CAIDA TOP ASNs
+# MAKE SURE CAIDA FOUND SOMETHING
 # ================================================================
 
-print()
-print()
+if not country_asns:
 
-print(
-    f"Top {len(country_asns)} "
-    f"CAIDA ASRank ASNs for "
-    f"{country_name} ({country_code})"
-)
-
-print("-" * 110)
-
-
-print(
-    f"{'AS':<14}"
-    f"{'Org Name':<42}"
-    f"{'Country':<10}"
-    f"{'ASRank':<12}"
-    f"{'Cone':<10}"
-)
-
-
-print("-" * 110)
-
-
-for item in country_asns:
-
-    asn = item["asn"]
-
-    name = item.get(
-        "asnName",
-        "Unknown"
-    )
-
-    country = (
-        item.get("country") or {}
-    ).get(
-        "iso",
-        "Unknown"
-    )
-
-    rank = item.get(
-        "rank",
-        "N/A"
-    )
-
-    cone = (
-        item.get("cone") or {}
-    ).get(
-        "numberAsns",
-        0
-    )
-
-
+    print()
     print(
-        f"AS{asn:<12}"
-        f"{name:<42}"
-        f"{country:<10}"
-        f"{str(rank):<12}"
-        f"{str(cone):<10}"
+        f"No ranked CAIDA ASNs were found "
+        f"for {country_name}."
     )
+
+    exit()
 
 
 # ================================================================
-# PART 2 - IHR HEGEMONY
+# PART 2
+# IHR Hegemony
 # ================================================================
 
 try:
@@ -144,11 +101,15 @@ except Exception as e:
 
 
 report_rows = (
-    hegemony_result["rows"]
+    hegemony_result[
+        "rows"
+    ]
 )
 
 snapshot = (
-    hegemony_result["snapshot"]
+    hegemony_result[
+        "snapshot"
+    ]
 )
 
 
@@ -159,7 +120,7 @@ snapshot = (
 print()
 print()
 
-print("=" * 125)
+print("=" * 160)
 
 print(
     "REPORT 1 - ASN AND HEGEMONY ANALYSIS"
@@ -175,29 +136,62 @@ print(
     f"{snapshot}"
 )
 
-print("=" * 125)
+print("=" * 160)
 
 print()
 
 
+# ================================================================
+# TABLE HEADER
+# ================================================================
+
 print(
     f"{'AS':<14}"
-    f"{'Org Name':<38}"
+    f"{'Org Name':<36}"
     f"{'Country':<10}"
+    f"{'CAIDA Rank':<15}"
+    f"{'Cone':<12}"
     f"{'Hegemony':<16}"
-    f"{'Country Rank':<20}"
-    f"{'Global Rank':<15}"
+    f"{'Country Heg. Rank':<20}"
+    f"{'Global Heg. Rank':<18}"
 )
 
+print("-" * 160)
 
-print("-" * 125)
 
+# ================================================================
+# TABLE ROWS
+# ================================================================
 
 for row in report_rows:
 
-    # --------------------------------
+    # ------------------------------------------------
+    # CAIDA Rank
+    # ------------------------------------------------
+
+    caida_rank = (
+        row["caida_rank"]
+    )
+
+    if caida_rank is None:
+
+        caida_rank = "N/A"
+
+
+    # ------------------------------------------------
+    # Customer Cone
+    # ------------------------------------------------
+
+    cone = row["cone"]
+
+    if cone is None:
+
+        cone = "N/A"
+
+
+    # ------------------------------------------------
     # Hegemony
-    # --------------------------------
+    # ------------------------------------------------
 
     if row["hegemony"] is None:
 
@@ -210,9 +204,9 @@ for row in report_rows:
         )
 
 
-    # --------------------------------
-    # Country Hegemony rank
-    # --------------------------------
+    # ------------------------------------------------
+    # Country Hegemony Rank
+    # ------------------------------------------------
 
     country_rank = (
         row[
@@ -220,15 +214,14 @@ for row in report_rows:
         ]
     )
 
-
     if country_rank is None:
 
         country_rank = "N/A"
 
 
-    # --------------------------------
-    # Global Hegemony rank
-    # --------------------------------
+    # ------------------------------------------------
+    # Global Hegemony Rank
+    # ------------------------------------------------
 
     global_rank = (
         row[
@@ -236,31 +229,32 @@ for row in report_rows:
         ]
     )
 
-
     if global_rank is None:
 
         global_rank = "N/A"
 
 
-    # --------------------------------
-    # Print
-    # --------------------------------
+    # ------------------------------------------------
+    # Print row
+    # ------------------------------------------------
 
     print(
         f"AS{row['asn']:<12}"
-        f"{row['asn_name']:<38}"
+        f"{row['asn_name']:<36}"
         f"{row['country']:<10}"
+        f"{str(caida_rank):<15}"
+        f"{str(cone):<12}"
         f"{hegemony:<16}"
         f"{str(country_rank):<20}"
-        f"{str(global_rank):<15}"
+        f"{str(global_rank):<18}"
     )
 
 
-print("-" * 125)
+print("-" * 160)
 
 
 # ================================================================
-# SUMMARY
+# REPORT SUMMARY
 # ================================================================
 
 hegemony_count = sum(
@@ -273,7 +267,13 @@ hegemony_count = sum(
 print()
 
 print(
-    f"CAIDA ASNs selected: "
+    f"Total CAIDA ASNs associated with "
+    f"{country_name}: "
+    f"{caida_result['total_country_asns']}"
+)
+
+print(
+    f"Top CAIDA ASNs selected for analysis: "
     f"{len(country_asns)}"
 )
 
@@ -283,8 +283,4 @@ print(
     f"{len(country_asns)}"
 )
 
-print(
-    f"Total CAIDA ASNs associated with "
-    f"{country_name}: "
-    f"{caida_result['total_country_asns']}"
-)
+print()
