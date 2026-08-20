@@ -68,18 +68,37 @@ query GetASNs($first: Int!, $offset: Int!) {
 
 
 # --------------------------------
-# Find top ASNs for country
+# Scan CAIDA dataset
 # --------------------------------
 
-country_asns = []
-seen_asns = set()
+top_country_asns = []
+
+seen_country_asns = set()
+
+total_country_asns = 0
+ranked_country_asns = 0
 
 offset = 0
 page_number = 1
+
+total_count = None
 total_pages = None
+effective_page_size = None
+
+records_checked = 0
+
+scan_complete = False
 
 
-while len(country_asns) < TOP_N:
+print()
+print(
+    f"Scanning CAIDA ASRank for "
+    f"{country_name} ({country_code})..."
+)
+print()
+
+
+while True:
 
     variables = {
         "first": PAGE_SIZE,
@@ -87,6 +106,7 @@ while len(country_asns) < TOP_N:
     }
 
     try:
+
         response = requests.post(
             CAIDA_URL,
             json={
@@ -99,8 +119,11 @@ while len(country_asns) < TOP_N:
         response.raise_for_status()
 
     except requests.RequestException as e:
+
+        print()
         print("Error fetching CAIDA data:")
         print(e)
+
         break
 
 
@@ -108,10 +131,12 @@ while len(country_asns) < TOP_N:
 
 
     # --------------------------------
-    # Check for GraphQL errors
+    # Check GraphQL errors
     # --------------------------------
 
     if "errors" in caida_data:
+
+        print()
         print("CAIDA GraphQL error:")
 
         for error in caida_data["errors"]:
@@ -128,38 +153,28 @@ while len(country_asns) < TOP_N:
 
 
     # --------------------------------
-    # Calculate total pages
+    # No results returned
     # --------------------------------
-
-    if total_pages is None:
-        total_pages = math.ceil(
-            total_count / PAGE_SIZE
-        )
-
-
-    # No more results
 
     if not edges:
         break
 
 
     # --------------------------------
-    # Debug pagination
+    # Determine actual page size
     # --------------------------------
 
-    first_rank = edges[0]["node"]["rank"]
-    last_rank = edges[-1]["node"]["rank"]
+    if effective_page_size is None:
 
-    print(
-        f"DEBUG: page = {page_number} "
-        f"results = {len(edges)} "
-        f"first rank = {first_rank} "
-        f"last rank = {last_rank}"
-    )
+        effective_page_size = len(edges)
+
+        total_pages = math.ceil(
+            total_count / effective_page_size
+        )
 
 
     # --------------------------------
-    # Search this page
+    # Search current page
     # --------------------------------
 
     for edge in edges:
@@ -175,7 +190,6 @@ while len(country_asns) < TOP_N:
 
 
         # Skip ASNs from other countries
-
         if country != country_code:
             continue
 
@@ -183,67 +197,136 @@ while len(country_asns) < TOP_N:
         asn = item["asn"]
 
 
-        # Skip duplicates
-
-        if asn in seen_asns:
+        # Skip duplicate ASN records
+        if asn in seen_country_asns:
             continue
 
 
-        country_asns.append(item)
-        seen_asns.add(asn)
+        seen_country_asns.add(asn)
+
+        total_country_asns += 1
 
 
-        # Stop once we have top 15
+        # --------------------------------
+        # Count only ranked ASNs
+        # --------------------------------
 
-        if len(country_asns) >= TOP_N:
-            break
+        rank = item.get("rank")
 
+        if rank is None:
+            continue
+
+
+        ranked_country_asns += 1
+
+
+        # --------------------------------
+        # Keep only the top 15
+        # --------------------------------
+
+        if len(top_country_asns) < TOP_N:
+            top_country_asns.append(item)
+
+
+    # --------------------------------
+    # Update number of records scanned
+    # --------------------------------
+
+    records_checked += len(edges)
+
+    progress = (
+        records_checked / total_count
+    ) * 100
+
+
+    # --------------------------------
+    # Progress output
+    # --------------------------------
 
     print(
-        f"Checked page {page_number}/{total_pages} "
-        f"- found {len(country_asns)}/{TOP_N}"
+        f"Page {page_number}/{total_pages} | "
+        f"{records_checked:,}/{total_count:,} ASNs checked "
+        f"({progress:.1f}%) | "
+        f"{country_code} matches: {total_country_asns}"
     )
 
 
     # --------------------------------
-    # Stop if top 15 found
-    # --------------------------------
-
-    if len(country_asns) >= TOP_N:
-        break
-
-
-    # --------------------------------
-    # Stop if API has no more pages
+    # Reached end of CAIDA dataset
     # --------------------------------
 
     if not page_info["hasNextPage"]:
+
+        scan_complete = True
         break
 
 
     # --------------------------------
-    # Move forward 5000 ASNs
+    # Move to next batch
+    #
+    # Use number actually returned rather
+    # than assuming CAIDA returned 5000.
     # --------------------------------
 
-    offset += PAGE_SIZE
+    offset += len(edges)
+
     page_number += 1
 
 
 # --------------------------------
-# Print results
+# Scan summary
 # --------------------------------
 
 print()
+print("-" * 100)
+
+if scan_complete:
+
+    print("CAIDA ASRank scan complete.")
+
+    print(
+        f"Dataset coverage: "
+        f"{records_checked:,}/{total_count:,} ASNs checked "
+        f"(100.0%)"
+    )
+
+else:
+
+    print("WARNING: CAIDA ASRank scan did not complete.")
+
+    if total_count is not None:
+
+        print(
+            f"Dataset coverage: "
+            f"{records_checked:,}/{total_count:,} ASNs checked"
+        )
+
 
 print(
-    f"Top {len(country_asns)} ASNs for "
+    f"Total CAIDA ASNs found for {country_name}: "
+    f"{total_country_asns}"
+)
+
+print(
+    f"Ranked ASNs found for {country_name}: "
+    f"{ranked_country_asns}"
+)
+
+
+# --------------------------------
+# Print top ASNs
+# --------------------------------
+
+print()
+print(
+    f"Top {len(top_country_asns)} ranked ASNs for "
     f"{country_name} ({country_code})"
 )
 
 print("-" * 100)
 
 
-for item in country_asns:
+for item in top_country_asns:
 
     asn = item["asn"]
 
@@ -282,14 +365,14 @@ for item in country_asns:
 
 
 # --------------------------------
-# Fewer than 15 exist
+# Fewer than requested number exist
 # --------------------------------
 
-if len(country_asns) < TOP_N:
+if ranked_country_asns < TOP_N:
 
     print()
 
     print(
-        f"Only {len(country_asns)} ranked ASNs were found "
-        f"for {country_name}."
+        f"Only {ranked_country_asns} ranked ASNs "
+        f"were found for {country_name}."
     )
