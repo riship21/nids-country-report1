@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+country-report2/*.csv
+country-report2/rpki_cache/
+country-report2/rpki_roa_cache/
+country-report2/rpki_cache_*.json

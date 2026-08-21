@@ -1,12 +1,22 @@
 import io
 import lzma
-import os
-import ipaddress
+import re
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-import requests
-import radix
+import ipaddress
 import pandas as pd
 import pycountry
+import requests
+
+try:
+    import radix
+except ImportError:
+    raise SystemExit(
+        "\nMissing dependency: py-radix\n"
+        "Install it with:\n"
+        "    pip install py-radix\n"
+    )
 
 
 # ============================================================
@@ -14,852 +24,690 @@ import pycountry
 # ============================================================
 
 TOP_N = 15
+PAGE_SIZE = 5000
+BGP_WINDOW_DAYS = 14
+MIN_PEERS_SEEING = 10
 
-# Change this to the country you want
-COUNTRY_INPUT = "US"
+# None = automatically use the most recent COMPLETE UTC day.
+# For a reproducible historical run, set e.g. "2026-08-20".
+ANALYSIS_END_DATE = None
 
-# RPKI snapshot
-RPKI_DATE = "2026-08-20"
+CAIDA_URL = "https://api.asrank.caida.org/v2/graphql"
 
-# CAIDA ASRank
-CAIDA_URL = (
-    "https://api.asrank.caida.org/v2/graphql"
-)
-
-# RIPEstat announced prefixes
 BGP_URL = (
     "https://stat.ripe.net/data/announced-prefixes/data.json"
 )
 
-# RIPE RPKI archive
-RPKI_BASE_URL = (
-    "https://ftp.ripe.net/rpki"
-)
+RPKI_BASE_URL = "https://ftp.ripe.net/rpki"
 
-# RPKI trust anchors
 TRUST_ANCHORS = [
     "afrinic",
     "apnic",
     "arin",
     "lacnic",
-    "ripencc"
+    "ripencc",
 ]
 
-# Local cache directory
-RPKI_CACHE_DIR = "rpki_cache"
+CACHE_DIR = Path("rpki_roa_cache")
 
 
 # ============================================================
-# COUNTRY
+# CAIDA GRAPHQL QUERY
+# ============================================================
+
+CAIDA_QUERY = """
+query ($first: Int!, $offset: Int!) {
+  asns(first: $first, offset: $offset, sort: "rank") {
+    totalCount
+    pageInfo {
+      hasNextPage
+    }
+    edges {
+      node {
+        asn
+        rank
+        asnName
+        country {
+          iso
+        }
+      }
+    }
+  }
+}
+"""
+
+
+# ============================================================
+# 1. COUNTRY INPUT
 # ============================================================
 
 def get_country(country_input):
-
     try:
-
-        country = pycountry.countries.lookup(
-            country_input
+        country = pycountry.countries.lookup(country_input)
+        return {
+            "code": country.alpha_2,
+            "name": country.name,
+        }
+    except LookupError:
+        raise ValueError(
+            f"Could not recognize country: {country_input}"
         )
 
-        return {
-            "name": country.name,
-            "code": country.alpha_2
-        }
-
-    except LookupError:
-
-        return None
-
 
 # ============================================================
-# CAIDA ASRANK
-# GET TOP ASes FOR COUNTRY
+# 2. GET TOP 15 COUNTRY ASNs FROM CAIDA ASRANK
 # ============================================================
 
-def get_top_asns(
-    country_code,
-    top_n=15
-):
+def get_top_country_asns(country_code, top_n=TOP_N):
+    country_code = country_code.upper()
 
     print()
-    print("=" * 80)
-
-    print(
-        f"Finding top {top_n} ASes "
-        f"for {country_code}"
-    )
-
-    print("=" * 80)
-
-    query = """
-    query GetASNs(
-        $first: Int!,
-        $offset: Int!
-    ) {
-
-        asns(
-            first: $first
-            offset: $offset
-            sort: "rank"
-        ) {
-
-            edges {
-
-                node {
-
-                    asn
-                    asnName
-                    rank
-
-                    country {
-                        iso
-                    }
-
-                }
-
-            }
-
-        }
-
-    }
-    """
-
-    response = requests.post(
-        CAIDA_URL,
-        json={
-            "query": query,
-            "variables": {
-                "first": 5000,
-                "offset": 0
-            }
-        },
-        timeout=60
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    if "errors" in data:
-
-        raise RuntimeError(
-            data["errors"]
-        )
-
-    edges = (
-        data["data"]["asns"]["edges"]
-    )
+    print(f"Scanning CAIDA ASRank for {country_code}...")
 
     results = []
+    seen_asns = set()
+    offset = 0
+    page = 1
 
-    for edge in edges:
+    while len(results) < top_n:
+        variables = {
+            "first": PAGE_SIZE,
+            "offset": offset,
+        }
 
-        item = edge["node"]
-
-        country = (
-            item.get("country")
-            or {}
-        ).get(
-            "iso"
+        response = requests.post(
+            CAIDA_URL,
+            json={
+                "query": CAIDA_QUERY,
+                "variables": variables,
+            },
+            timeout=60,
         )
+        response.raise_for_status()
 
-        if country != country_code:
+        payload = response.json()
 
-            continue
+        if payload.get("errors"):
+            raise RuntimeError(
+                f"CAIDA GraphQL error: {payload['errors']}"
+            )
 
-        results.append(
-            {
-                "asn": int(
-                    item["asn"]
-                ),
+        data = payload["data"]["asns"]
+        edges = data.get("edges", [])
 
-                "name": item.get(
-                    "asnName",
-                    "Unknown"
-                ),
+        if not edges:
+            break
 
-                "rank": item.get(
-                    "rank"
-                )
-            }
+        for edge in edges:
+            node = edge.get("node")
+            if not node:
+                continue
+
+            country = node.get("country")
+            if not country:
+                continue
+
+            if country.get("iso") != country_code:
+                continue
+
+            asn_value = node.get("asn")
+            if asn_value is None:
+                continue
+
+            asn = int(asn_value)
+
+            if asn in seen_asns:
+                continue
+
+            seen_asns.add(asn)
+
+            results.append(
+                {
+                    "asn": asn,
+                    "name": node.get("asnName") or "Unknown",
+                    "asrank": node.get("rank"),
+                    "country_rank": len(results) + 1,
+                }
+            )
+
+            if len(results) >= top_n:
+                break
+
+        print(
+            f"Page {page} | Found "
+            f"{len(results)}/{top_n} ASNs"
         )
 
         if len(results) >= top_n:
-
             break
+
+        if not data["pageInfo"]["hasNextPage"]:
+            break
+
+        offset += PAGE_SIZE
+        page += 1
 
     return results
 
 
 # ============================================================
-# RIPESTAT
-# GET BGP PREFIXES FOR ASN
+# 3. CHOOSE A COMPLETE 14-DAY BGP WINDOW
 # ============================================================
 
-def get_bgp_prefixes(asn):
+def get_analysis_window(
+    days=BGP_WINDOW_DAYS,
+    analysis_end_date=ANALYSIS_END_DATE,
+):
+    if days < 1:
+        raise ValueError("BGP_WINDOW_DAYS must be at least 1")
 
+    if analysis_end_date is None:
+        # Do not use the partially completed current UTC day.
+        final_day = (
+            datetime.now(timezone.utc).date()
+            - timedelta(days=1)
+        )
+    else:
+        try:
+            final_day = datetime.strptime(
+                analysis_end_date,
+                "%Y-%m-%d",
+            ).date()
+        except ValueError:
+            raise ValueError(
+                "ANALYSIS_END_DATE must use YYYY-MM-DD"
+            )
+
+    start_day = final_day - timedelta(days=days - 1)
+    end_exclusive = final_day + timedelta(days=1)
+
+    starttime = f"{start_day.isoformat()}T00:00"
+    endtime = f"{end_exclusive.isoformat()}T00:00"
+
+    # Validate against the daily RPKI snapshot from the final
+    # completed day in the BGP observation window.
+    rpki_date = final_day.isoformat()
+
+    return starttime, endtime, rpki_date
+
+
+# ============================================================
+# 4. GET BGP PREFIXES FOR ONE ASN
+# ============================================================
+
+def get_bgp_prefixes(asn, starttime, endtime):
     print()
-    print(
-        f"Getting BGP prefixes "
-        f"for AS{asn}..."
-    )
+    print("=" * 70)
+    print(f"Getting BGP prefixes for AS{asn}")
+    print(f"Window: {starttime} to {endtime} UTC")
+    print("=" * 70)
+
+    params = {
+        "resource": f"AS{asn}",
+        "starttime": starttime,
+        "endtime": endtime,
+        "min_peers_seeing": MIN_PEERS_SEEING,
+    }
 
     response = requests.get(
         BGP_URL,
-        params={
-            "resource": f"AS{asn}"
-        },
-        timeout=60
+        params=params,
+        timeout=60,
     )
-
     response.raise_for_status()
 
-    data = response.json()
+    payload = response.json()
 
-    if data.get("status") != "ok":
-
+    if payload.get("status") != "ok":
         raise RuntimeError(
-            data.get(
-                "message",
-                "RIPEstat error"
-            )
+            payload.get("message", "RIPEstat error")
         )
 
     prefixes = []
 
-    for item in (
-        data
-        .get("data", {})
-        .get("prefixes", [])
-    ):
+    for item in payload.get("data", {}).get("prefixes", []):
+        if isinstance(item, dict):
+            prefix = item.get("prefix")
+        else:
+            prefix = item
 
-        prefix = item.get(
-            "prefix"
-        )
+        if not prefix:
+            continue
 
-        if prefix:
-
-            prefixes.append(
-                prefix
+        try:
+            network = ipaddress.ip_network(
+                prefix,
+                strict=False,
             )
+            prefixes.append(str(network))
+        except ValueError:
+            continue
 
-    # Remove duplicates
-    prefixes = sorted(
-        set(prefixes)
-    )
+    prefixes = sorted(set(prefixes))
 
-    print(
-        f"BGP prefixes found: "
-        f"{len(prefixes):,}"
-    )
+    ipv4_count = sum(1 for prefix in prefixes if ":" not in prefix)
+    ipv6_count = len(prefixes) - ipv4_count
+
+    print(f"BGP prefixes found: {len(prefixes):,}")
+    print(f"  IPv4: {ipv4_count:,}")
+    print(f"  IPv6: {ipv6_count:,}")
 
     return prefixes
 
 
 # ============================================================
-# DOWNLOAD ONE RPKI FILE
+# 5. DOWNLOAD RPKI VRPs
 # ============================================================
 
-def download_roa_file(
-    trust_anchor,
-    date
-):
-
+def get_roa_url(trust_anchor, date):
     year = date[:4]
     month = date[5:7]
     day = date[8:10]
 
-    os.makedirs(
-        RPKI_CACHE_DIR,
-        exist_ok=True
-    )
-
-    cache_file = (
-        f"{RPKI_CACHE_DIR}/"
-        f"{trust_anchor}_{date}.csv"
-    )
-
-    # --------------------------------------------------------
-    # Use cached file
-    # --------------------------------------------------------
-
-    if os.path.exists(
-        cache_file
-    ):
-
-        print(
-            f"Using cached "
-            f"{trust_anchor}"
-        )
-
-        return pd.read_csv(
-            cache_file
-        )
-
-    # --------------------------------------------------------
-    # Build archive URL
-    # --------------------------------------------------------
-
-    url = (
+    return (
         f"{RPKI_BASE_URL}/"
         f"{trust_anchor}.tal/"
         f"{year}/{month}/{day}/"
         f"roas.csv.xz"
     )
 
-    print()
-    print(
-        f"Downloading "
-        f"{trust_anchor}..."
+
+def download_roas(trust_anchor, date):
+    CACHE_DIR.mkdir(exist_ok=True)
+
+    cache_file = (
+        CACHE_DIR
+        / f"{trust_anchor}_{date}_roas.csv.xz"
     )
 
-    print(url)
-
-    try:
+    if cache_file.exists():
+        print(f"Loading {trust_anchor} from cache...")
+        compressed = cache_file.read_bytes()
+    else:
+        url = get_roa_url(trust_anchor, date)
+        print(f"Downloading {trust_anchor}...")
 
         response = requests.get(
             url,
-            timeout=120
+            timeout=120,
         )
 
-    except requests.RequestException as e:
+        if response.status_code != 200:
+            print(
+                f"  Failed: HTTP {response.status_code}"
+            )
+            return None
 
-        print(
-            f"Download error: {e}"
-        )
-
-        return None
-
-    if response.status_code != 200:
-
-        print(
-            f"HTTP "
-            f"{response.status_code}"
-        )
-
-        return None
-
-    # --------------------------------------------------------
-    # Decompress XZ
-    # --------------------------------------------------------
+        compressed = response.content
+        cache_file.write_bytes(compressed)
 
     try:
-
-        decompressed = lzma.decompress(
-            response.content
+        decompressed = lzma.decompress(compressed)
+    except lzma.LZMAError as error:
+        raise RuntimeError(
+            f"Could not decompress {trust_anchor}: {error}"
         )
-
-    except lzma.LZMAError as e:
-
-        print(
-            f"XZ decompression error: "
-            f"{e}"
-        )
-
-        return None
-
-    # --------------------------------------------------------
-    # Read CSV
-    # --------------------------------------------------------
 
     df = pd.read_csv(
-        io.BytesIO(
-            decompressed
-        )
+        io.BytesIO(decompressed),
+        low_memory=False,
     )
 
-    # Remove whitespace
     df.columns = [
-        column.strip()
+        str(column).strip()
         for column in df.columns
     ]
 
-    # Add trust anchor
-    df["trust_anchor"] = (
-        trust_anchor
-    )
+    df["trust_anchor"] = trust_anchor
 
-    print(
-        f"Downloaded "
-        f"{len(df):,} ROAs"
-    )
-
-    # --------------------------------------------------------
-    # Cache
-    # --------------------------------------------------------
-
-    df.to_csv(
-        cache_file,
-        index=False
-    )
-
-    print(
-        f"Cached as "
-        f"{cache_file}"
-    )
+    print(f"  {len(df):,} VRP rows")
 
     return df
 
 
-# ============================================================
-# DOWNLOAD ALL RPKI DATA
-# ============================================================
-
-def download_all_roas(
-    date
-):
-
-    print()
-    print("=" * 80)
-
-    print(
-        f"Loading RPKI snapshot "
-        f"{date}"
-    )
-
-    print("=" * 80)
-
+def download_all_roas(date):
     frames = []
 
-    for trust_anchor in TRUST_ANCHORS:
+    print()
+    print("=" * 70)
+    print(f"Loading RPKI VRPs for {date}")
+    print("=" * 70)
 
-        df = download_roa_file(
+    for trust_anchor in TRUST_ANCHORS:
+        df = download_roas(
             trust_anchor,
-            date
+            date,
         )
 
         if df is not None:
-
-            frames.append(
-                df
-            )
+            frames.append(df)
 
     if not frames:
-
         raise RuntimeError(
-            "No RPKI data could be loaded."
+            "No RPKI data downloaded. "
+            f"No usable RPKI archive was found for {date}."
         )
 
     combined = pd.concat(
         frames,
-        ignore_index=True
+        ignore_index=True,
     )
 
     print()
     print(
-        f"Total RPKI ROAs loaded: "
-        f"{len(combined):,}"
+        f"Raw VRP rows loaded: {len(combined):,}"
     )
 
     return combined
 
 
 # ============================================================
-# BUILD RADIX TREE
+# 6. BUILD RADIX TREE
 # ============================================================
 
-def build_radix_tree(
-    rpki_df
-):
+def parse_asn(value):
+    match = re.search(r"(\d+)", str(value))
+
+    if not match:
+        return None
+
+    return int(match.group(1))
+
+
+def parse_max_length(value, network):
+    if pd.isna(value):
+        return network.prefixlen
+
+    text = str(value).strip()
+
+    if not text or text.lower() == "nan":
+        return network.prefixlen
+
+    try:
+        max_length = int(float(text))
+    except ValueError:
+        return None
+
+    if max_length < network.prefixlen:
+        return None
+
+    if network.version == 4 and max_length > 32:
+        return None
+
+    if network.version == 6 and max_length > 128:
+        return None
+
+    return max_length
+
+
+def build_roa_radix(rpki_df):
+    required_columns = [
+        "IP Prefix",
+        "ASN",
+        "Max Length",
+        "trust_anchor",
+    ]
+
+    for column in required_columns:
+        if column not in rpki_df.columns:
+            raise RuntimeError(
+                f"Missing RPKI column: {column}"
+            )
 
     print()
-    print("=" * 80)
-
-    print(
-        "Building RPKI radix tree..."
-    )
-
-    print("=" * 80)
+    print("=" * 70)
+    print("Building RPKI radix tree...")
+    print("=" * 70)
 
     tree = radix.Radix()
+    seen_vrps = set()
 
     inserted = 0
+    skipped = 0
+    duplicates = 0
 
-    for _, row in rpki_df.iterrows():
+    columns = rpki_df[
+        [
+            "IP Prefix",
+            "ASN",
+            "Max Length",
+            "trust_anchor",
+        ]
+    ]
 
-        prefix = str(
-            row["IP Prefix"]
-        ).strip()
+    for (
+        prefix_value,
+        asn_value,
+        max_length_value,
+        trust_anchor,
+    ) in columns.itertuples(index=False, name=None):
 
         try:
-
             network = ipaddress.ip_network(
-                prefix,
-                strict=False
+                str(prefix_value).strip(),
+                strict=False,
             )
-
         except ValueError:
-
+            skipped += 1
             continue
 
-        node = tree.add(
-            str(network)
-        )
+        asn = parse_asn(asn_value)
 
-        # A prefix can have
-        # multiple ROAs.
-
-        if "roas" not in node.data:
-
-            node.data["roas"] = []
-
-        # Normalize ASN
-
-        asn_string = str(
-            row["ASN"]
-        )
-
-        asn_string = (
-            asn_string
-            .replace(
-                "AS",
-                ""
-            )
-            .strip()
-        )
-
-        try:
-
-            roa_asn = int(
-                asn_string
-            )
-
-        except ValueError:
-
+        if asn is None:
+            skipped += 1
             continue
 
-        # Normalize max length
+        max_length = parse_max_length(
+            max_length_value,
+            network,
+        )
 
-        try:
-
-            max_length = int(
-                row["Max Length"]
-            )
-
-        except (
-            ValueError,
-            TypeError
-        ):
-
+        if max_length is None:
+            skipped += 1
             continue
 
-        node.data[
-            "roas"
-        ].append(
+        prefix = str(network)
+
+        key = (
+            prefix,
+            asn,
+            max_length,
+        )
+
+        if key in seen_vrps:
+            duplicates += 1
+            continue
+
+        seen_vrps.add(key)
+
+        node = tree.add(prefix)
+
+        if "vrps" not in node.data:
+            node.data["vrps"] = []
+
+        node.data["vrps"].append(
             {
-                "asn":
-                    roa_asn,
-
-                "max_length":
-                    max_length,
-
-                "trust_anchor":
-                    row[
-                        "trust_anchor"
-                    ]
+                "asn": asn,
+                "max_length": max_length,
+                "trust_anchor": trust_anchor,
             }
         )
 
         inserted += 1
 
-    print(
-        f"Inserted "
-        f"{inserted:,} ROAs"
-    )
-
-    print(
-        "Radix tree ready."
-    )
+    print(f"Unique VRPs inserted: {inserted:,}")
+    print(f"Duplicate VRPs skipped: {duplicates:,}")
+    print(f"Malformed rows skipped: {skipped:,}")
+    print(f"Radix nodes: {len(tree.prefixes()):,}")
 
     return tree
 
 
 # ============================================================
-# VALIDATE ONE PREFIX
+# 7. FIND COVERING VRPs
 # ============================================================
 
-def validate_prefix(
-    prefix,
-    origin_asn,
-    tree
-):
+def get_covering_vrps(prefix, roa_tree):
+    """
+    Return every VRP whose prefix covers the BGP prefix.
+
+    This preserves the working radix-tree method: starting at
+    the BGP prefix, walk toward /0 and perform exact radix
+    lookups rather than scanning the full VRP table.
+    """
 
     try:
-
         network = ipaddress.ip_network(
             prefix,
-            strict=False
+            strict=False,
         )
-
     except ValueError:
+        return None, []
 
-        return "UNKNOWN"
+    vrps = []
+    current = network
 
-    # --------------------------------------------------------
-    # Find ROAs covering this prefix
-    # --------------------------------------------------------
+    while True:
+        node = roa_tree.search_exact(str(current))
 
-    covered_nodes = (
-        tree.search_covering(
-            str(network)
-        )
+        if node is not None:
+            vrps.extend(node.data.get("vrps", []))
+
+        if current.prefixlen == 0:
+            break
+
+        current = current.supernet()
+
+    return network, vrps
+
+
+# ============================================================
+# 8. VALIDATE ONE BGP PREFIX
+# ============================================================
+
+def validate_prefix(prefix, origin_asn, roa_tree):
+    network, candidates = get_covering_vrps(
+        prefix,
+        roa_tree,
     )
 
-    if not covered_nodes:
-
+    if network is None:
         return "UNKNOWN"
 
-    # --------------------------------------------------------
-    # Collect ROAs
-    # --------------------------------------------------------
-
-    roas = []
-
-    for node in covered_nodes:
-
-        roas.extend(
-            node.data.get(
-                "roas",
-                []
-            )
-        )
-
-    if not roas:
-
+    if not candidates:
         return "UNKNOWN"
 
-    # --------------------------------------------------------
-    # Find ROAs authorizing this ASN
-    # --------------------------------------------------------
+    prefix_length = network.prefixlen
+    matching_asn = []
 
-    matching_roas = [
-        roa
-        for roa in roas
-        if roa["asn"] == origin_asn
-    ]
+    # VALID has highest priority.
+    for vrp in candidates:
+        if vrp["asn"] != origin_asn:
+            continue
 
-    # --------------------------------------------------------
-    # ROA exists but authorizes
-    # a different ASN
-    # --------------------------------------------------------
+        matching_asn.append(vrp)
 
-    if not matching_roas:
-
-        return "INVALID ASN"
-
-    # --------------------------------------------------------
-    # Check prefix length
-    # --------------------------------------------------------
-
-    prefix_length = (
-        network.prefixlen
-    )
-
-    for roa in matching_roas:
-
-        if (
-            prefix_length
-            <=
-            roa["max_length"]
-        ):
-
+        if prefix_length <= vrp["max_length"]:
             return "VALID"
 
-    # --------------------------------------------------------
-    # ASN authorized, but prefix
-    # is too specific
-    # --------------------------------------------------------
+    # A covering VRP authorizes the ASN, but not this
+    # more-specific prefix length.
+    if matching_asn:
+        return "INVALID LENGTH"
 
-    return "INVALID LENGTH"
+    # Covering VRPs exist, but none authorize the origin ASN.
+    return "INVALID ASN"
 
 
 # ============================================================
-# VALIDATE ALL PREFIXES FOR ONE ASN
+# 9. VALIDATE ALL PREFIXES FOR ONE ASN
 # ============================================================
 
-def validate_asn(
-    asn,
-    prefixes,
-    tree
-):
-
+def validate_asn(asn, prefixes, roa_tree):
     print()
-    print("-" * 80)
-
-    print(
-        f"Validating AS{asn}"
-    )
-
-    print("-" * 80)
+    print("=" * 70)
+    print(f"Validating BGP prefixes for AS{asn}")
+    print("=" * 70)
 
     counts = {
         "VALID": 0,
         "INVALID ASN": 0,
         "INVALID LENGTH": 0,
-        "UNKNOWN": 0
+        "UNKNOWN": 0,
     }
 
-    total = len(
-        prefixes
-    )
+    total = len(prefixes)
 
     for index, prefix in enumerate(
         prefixes,
-        start=1
+        start=1,
     ):
-
         status = validate_prefix(
             prefix,
             asn,
-            tree
+            roa_tree,
         )
 
-        counts[
-            status
-        ] += 1
+        counts[status] += 1
 
-        # ----------------------------------------------------
-        # Progress every 1,000
-        # ----------------------------------------------------
-
-        if (
-            index % 1000 == 0
-            or
-            index == total
-        ):
-
-            percentage = (
-                index
-                /
-                total
-                *
-                100
-            )
+        if index % 1000 == 0 or index == total:
+            percent = (
+                index / total * 100
+            ) if total else 100
 
             print(
-                f"  Validated "
-                f"{index:,}/"
-                f"{total:,} "
-                f"("
-                f"{percentage:.1f}%"
-                f")"
+                f"Validated {index:,}/{total:,} "
+                f"({percent:.1f}%)"
             )
 
     return counts
 
 
 # ============================================================
-# CREATE SUMMARY
+# 10. BUILD ONE RESULT ROW
 # ============================================================
 
-def create_summary(
-    asn,
-    name,
-    caida_rank,
+def build_result_row(
+    asn_info,
     prefixes,
-    counts
+    counts,
 ):
+    valid = counts["VALID"]
+    invalid_asn = counts["INVALID ASN"]
+    invalid_length = counts["INVALID LENGTH"]
+    unknown = counts["UNKNOWN"]
 
-    total = len(
-        prefixes
-    )
-
-    valid = counts[
-        "VALID"
-    ]
-
-    invalid_asn = counts[
-        "INVALID ASN"
-    ]
-
-    invalid_length = counts[
-        "INVALID LENGTH"
-    ]
-
-    unknown = counts[
-        "UNKNOWN"
-    ]
-
-    # --------------------------------------------------------
-    # Total invalid
-    # --------------------------------------------------------
-
-    invalid = (
-        invalid_asn
-        +
-        invalid_length
-    )
-
-    # --------------------------------------------------------
-    # RPKI-covered announcements
-    #
-    # Valid + Invalid
-    #
-    # Unknown = no applicable ROA
-    # --------------------------------------------------------
-
-    covered = (
-        valid
-        +
-        invalid
-    )
+    invalid = invalid_asn + invalid_length
+    covered = valid + invalid
+    total = valid + invalid + unknown
 
     if total > 0:
-
-        coverage = (
-            covered
-            /
-            total
-            *
-            100
-        )
-
-        invalid_percentage = (
-            invalid
-            /
-            total
-            *
-            100
-        )
-
+        coverage = covered / total * 100
+        invalid_percent = invalid / total * 100
     else:
-
         coverage = 0.0
-        invalid_percentage = 0.0
+        invalid_percent = 0.0
+
+    ipv4_count = sum(
+        1 for prefix in prefixes
+        if ":" not in prefix
+    )
+    ipv6_count = len(prefixes) - ipv4_count
 
     return {
-        "ASN":
-            f"AS{asn}",
-
-        "AS Name":
-            name,
-
-        "CAIDA Rank":
-            caida_rank,
-
-        "BGP Prefixes":
-            total,
-
-        "Valid":
-            valid,
-
-        "Invalid ASN":
-            invalid_asn,
-
-        "Invalid Length":
-            invalid_length,
-
-        "Invalid":
-            invalid,
-
-        "Unknown":
-            unknown,
-
-        "RPKI Coverage":
-            f"{coverage:.2f}%",
-
-        "Invalid %":
-            f"{invalid_percentage:.2f}%"
+        "Country Rank": asn_info["country_rank"],
+        "ASN": f"AS{asn_info['asn']}",
+        "AS Name": asn_info["name"],
+        "ASRank": asn_info["asrank"],
+        "IPv4 Prefixes": ipv4_count,
+        "IPv6 Prefixes": ipv6_count,
+        "BGP Prefixes": len(prefixes),
+        "Valid": valid,
+        "Invalid ASN": invalid_asn,
+        "Invalid Length": invalid_length,
+        "Unknown": unknown,
+        "RPKI Coverage": f"{coverage:.2f}%",
+        "Invalid": f"{invalid_percent:.2f}%",
     }
 
 
@@ -868,315 +716,181 @@ def create_summary(
 # ============================================================
 
 def main():
+    country_input = input(
+        "Enter a country name or country code: "
+    ).strip()
 
-    # --------------------------------------------------------
-    # Country
-    # --------------------------------------------------------
-
-    country = get_country(
-        COUNTRY_INPUT
-    )
-
-    if country is None:
-
-        print(
-            "Country not found."
-        )
-
+    try:
+        country = get_country(country_input)
+    except ValueError as error:
+        print(error)
         return
 
-    country_name = (
-        country["name"]
-    )
-
-    country_code = (
-        country["code"]
-    )
+    country_code = country["code"]
+    country_name = country["name"]
 
     print()
-    print("=" * 80)
-
-    print(
-        f"RPKI REPORT FOR "
-        f"{country_name} "
-        f"({country_code})"
-    )
-
-    print("=" * 80)
+    print(f"Country: {country_name} ({country_code})")
 
     # --------------------------------------------------------
-    # Step 1
-    # Get top 15 ASes
+    # Get the top 15 ASNs for the selected country.
     # --------------------------------------------------------
-
-    top_asns = get_top_asns(
-        country_code,
-        TOP_N
-    )
-
-    if not top_asns:
-
-        print(
-            "No ASes found."
-        )
-
-        return
 
     print()
     print(
-        f"Top {len(top_asns)} ASes:"
+        f"Getting top {TOP_N} ASNs "
+        "from CAIDA ASRank..."
     )
 
+    try:
+        asns = get_top_country_asns(
+            country_code,
+            TOP_N,
+        )
+    except Exception as error:
+        print(f"CAIDA query failed: {error}")
+        return
+
+    if not asns:
+        print("No ASNs were found for this country.")
+        return
+
     print()
+    print("Top ASNs:")
 
-    for position, item in enumerate(
-        top_asns,
-        start=1
-    ):
-
+    for item in asns:
         print(
-            f"{position:2}. "
-            f"AS{item['asn']:<8} "
+            f"{item['country_rank']:>2}. "
+            f"AS{item['asn']:<10} "
             f"{item['name']:<35} "
-            f"CAIDA Rank: "
-            f"{item['rank']}"
+            f"Global Rank: {item['asrank']}"
         )
 
-    # --------------------------------------------------------
-    # Step 2
-    # Download RPKI ONCE
-    # --------------------------------------------------------
-
-    rpki_df = download_all_roas(
-        RPKI_DATE
-    )
-
-    # --------------------------------------------------------
-    # Step 3
-    # Build radix tree ONCE
-    # --------------------------------------------------------
-
-    tree = build_radix_tree(
-        rpki_df
-    )
-
-    # --------------------------------------------------------
-    # Step 4
-    # Process each AS
-    # --------------------------------------------------------
-
-    results = []
-
-    for position, item in enumerate(
-        top_asns,
-        start=1
-    ):
-
-        asn = item[
-            "asn"
-        ]
-
-        name = item[
-            "name"
-        ]
-
-        caida_rank = item[
-            "rank"
-        ]
-
+    if len(asns) < TOP_N:
         print()
-        print()
-        print("=" * 100)
-
         print(
-            f"[{position}/{len(top_asns)}] "
-            f"AS{asn} - {name}"
+            f"Note: CAIDA returned only {len(asns)} "
+            f"matching ASN(s) for {country_code}."
         )
 
-        print("=" * 100)
+    # --------------------------------------------------------
+    # Use the last 14 complete UTC days.
+    # --------------------------------------------------------
 
-        # ----------------------------------------------------
-        # Get BGP prefixes
-        # ----------------------------------------------------
+    try:
+        starttime, endtime, rpki_date = (
+            get_analysis_window()
+        )
+    except ValueError as error:
+        print(error)
+        return
+
+    print()
+    print("Analysis period:")
+    print(f"  BGP start: {starttime} UTC")
+    print(f"  BGP end:   {endtime} UTC (exclusive)")
+    print(f"  RPKI snapshot: {rpki_date}")
+
+    # --------------------------------------------------------
+    # Load the RPKI snapshot ONCE and build ONE radix tree.
+    # Every ASN below reuses this same tree.
+    # --------------------------------------------------------
+
+    try:
+        raw_roas = download_all_roas(rpki_date)
+        roa_tree = build_roa_radix(raw_roas)
+        del raw_roas
+    except Exception as error:
+        print(f"RPKI loading failed: {error}")
+        return
+
+    # --------------------------------------------------------
+    # Validate every top-country ASN using local radix lookups.
+    # --------------------------------------------------------
+
+    rows = []
+
+    for asn_info in asns:
+        asn = asn_info["asn"]
 
         try:
-
             prefixes = get_bgp_prefixes(
-                asn
+                asn,
+                starttime,
+                endtime,
             )
-
-        except Exception as e:
-
-            print(
-                f"Error getting BGP "
-                f"prefixes for AS{asn}: "
-                f"{e}"
-            )
-
-            continue
-
-        if not prefixes:
-
-            print(
-                "No BGP prefixes found."
-            )
-
-            continue
-
-        # ----------------------------------------------------
-        # Validate locally
-        # ----------------------------------------------------
-
-        try:
 
             counts = validate_asn(
                 asn,
                 prefixes,
-                tree
+                roa_tree,
             )
 
-        except Exception as e:
+            rows.append(
+                build_result_row(
+                    asn_info,
+                    prefixes,
+                    counts,
+                )
+            )
 
+        except Exception as error:
+            print()
             print(
-                f"Validation error "
-                f"for AS{asn}: {e}"
+                f"AS{asn} failed: {error}"
             )
 
-            continue
-
-        # ----------------------------------------------------
-        # Create result
-        # ----------------------------------------------------
-
-        result = create_summary(
-            asn,
-            name,
-            caida_rank,
-            prefixes,
-            counts
-        )
-
-        results.append(
-            result
-        )
-
-        # ----------------------------------------------------
-        # Show individual result
-        # ----------------------------------------------------
-
-        print()
-
-        print(
-            f"AS{asn} result:"
-        )
-
-        print(
-            f"  BGP Prefixes: "
-            f"{result['BGP Prefixes']:,}"
-        )
-
-        print(
-            f"  Valid: "
-            f"{result['Valid']:,}"
-        )
-
-        print(
-            f"  Invalid ASN: "
-            f"{result['Invalid ASN']:,}"
-        )
-
-        print(
-            f"  Invalid Length: "
-            f"{result['Invalid Length']:,}"
-        )
-
-        print(
-            f"  Unknown: "
-            f"{result['Unknown']:,}"
-        )
-
-        print(
-            f"  RPKI Coverage: "
-            f"{result['RPKI Coverage']}"
-        )
+            # Keep the ASN visible in the final table even if
+            # its BGP lookup fails.
+            rows.append(
+                {
+                    "Country Rank": asn_info["country_rank"],
+                    "ASN": f"AS{asn}",
+                    "AS Name": asn_info["name"],
+                    "ASRank": asn_info["asrank"],
+                    "IPv4 Prefixes": 0,
+                    "IPv6 Prefixes": 0,
+                    "BGP Prefixes": 0,
+                    "Valid": 0,
+                    "Invalid ASN": 0,
+                    "Invalid Length": 0,
+                    "Unknown": 0,
+                    "RPKI Coverage": "N/A",
+                    "Invalid": "N/A",
+                }
+            )
 
     # --------------------------------------------------------
-    # No results
+    # Final summary table.
     # --------------------------------------------------------
 
-    if not results:
-
-        print()
-        print(
-            "No RPKI results were produced."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # Final DataFrame
-    # --------------------------------------------------------
-
-    final_df = pd.DataFrame(
-        results
-    )
-
-    # --------------------------------------------------------
-    # Print final table
-    # --------------------------------------------------------
+    table = pd.DataFrame(rows)
 
     print()
-    print()
-    print("=" * 140)
-
+    print("=" * 150)
     print(
-        f"TOP {len(results)} AS RPKI REPORT - "
-        f"{country_name}"
+        f"RPKI RADIX-TREE SUMMARY - "
+        f"{country_name} ({country_code})"
     )
-
-    print("=" * 140)
-
-    print(
-        final_df.to_string(
-            index=False
-        )
-    )
+    print("=" * 150)
+    print(table.to_string(index=False))
 
     # --------------------------------------------------------
-    # Save CSV
+    # Save CSV.
     # --------------------------------------------------------
 
     filename = (
-        f"{country_code}_"
-        f"top_{len(results)}_"
-        f"rpki_report.csv"
+        f"{country_code.lower()}_rpki_radix_summary.csv"
     )
 
-    final_df.to_csv(
+    table.to_csv(
         filename,
         index=False,
-        encoding="utf-8-sig"
     )
 
     print()
-    print(
-        "=" * 80
-    )
+    print(f"Saved: {filename}")
 
-    print(
-        f"Report saved to: "
-        f"{filename}"
-    )
-
-    print(
-        "=" * 80
-    )
-
-
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
-
     main()
